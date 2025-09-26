@@ -40,6 +40,8 @@ class CsvChartApp extends StatelessWidget {
 
 enum ChartType { line, spline, stepLine }
 
+enum LabelSource { fromSettings, fromCsv }
+
 class ChartViewerPage extends StatefulWidget {
   const ChartViewerPage({super.key});
   @override
@@ -49,6 +51,7 @@ class ChartViewerPage extends StatefulWidget {
 class _ChartViewerPageState extends State<ChartViewerPage> {
   // === STATE VARIABLES ===
   int? _activePanelIndex;
+  double _panelWidth = 350.0;
 
   // State for Auto-Labeling
   double _autoLabelAddThreshold = 0.8;
@@ -57,7 +60,10 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
   // Project and File State
   String? _projectFolderPath;
   List<FileSystemEntity> _csvFilesInProject = [];
+  List<FileSystemEntity> _filteredCsvFilesInProject = [];
   File? _currentlyLoadedFile;
+  final TextEditingController _projectFilterController =
+      TextEditingController();
 
   // CSV Data State
   List<List<dynamic>>? _fullCsvData;
@@ -78,6 +84,8 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
   double _lineWidth = 1.5;
   double _markerWidth = 4.0;
   double _markerHeight = 4.0;
+  bool _isNormalizationEnabled = false;
+  double _normalizationPercentile = 1.0; // 1.0 for P100
 
   // Editing State
   bool _isEditMode = false;
@@ -91,11 +99,29 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
   TreeEnsembleClassifier? _treeModel;
   List<double>? _treeProbabilities;
   bool _showProbabilities = true;
+  bool _probabilityChartTypeIsBar = false; // false = Line, true = Bar
+  double _probabilityOpacity = 0.7;
+
+  // === NEW: State for Label Settings ===
+  Map<String, dynamic>? _labelSettings;
+  final Set<String> _selectedActiveLabels = <String>{};
 
   // Chart Behavior
   late ZoomPanBehavior _zoomPanBehavior;
 
+  // === PREFERENCE KEYS ===
+  static const String _projectFolderPathKey = 'project_folder_path';
+  static const String _treeFolderPathKey = 'tree_folder_path';
+  static const String _lastCsvFileKey = 'last_csv_file_path';
+  static const String _lastModelFileKey = 'last_model_file_path';
   static const String _globalSelectedColumnsKey = 'global_selected_columns_v1';
+  static const String _labelSettingsKey = 'label_settings_json_v1';
+  static const String _selectedActiveLabelsKey = 'selected_active_labels_v1';
+  static const String _showLabelsKey = 'show_labels_v1';
+
+  // State for choosing the label source
+  LabelSource _activeLabelSource = LabelSource.fromCsv;
+  bool _showLabels = true;
 
   @override
   void initState() {
@@ -106,12 +132,26 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
       enableSelectionZooming: true,
     );
 
-    _loadInitialFolder().then((loaded) {
-      if (loaded) {
-        setState(() => _activePanelIndex = 0);
-      }
-    });
-    _loadPreferences();
+    _projectFilterController.addListener(_filterProjectFiles);
+    _initializeApplication();
+  }
+
+  @override
+  void dispose() {
+    _projectFilterController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _initializeApplication() async {
+    await _loadPreferences();
+    bool folderLoaded = await _loadInitialFolder();
+    if (folderLoaded) {
+      await _loadLastSession();
+      setState(() => _activePanelIndex = 0);
+    }
+    if (_labelSettings != null) {
+      _applyLoadedLabelSettings();
+    }
   }
 
   // === UI HELPER METHODS ===
@@ -123,6 +163,14 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
         backgroundColor: isError ? Theme.of(context).colorScheme.error : null,
       ),
     );
+  }
+
+  // === REFACTORED HELPER ===
+  bool _isDestructiveAction(String title) {
+    final lowerTitle = title.toLowerCase();
+    return lowerTitle.contains('delete') ||
+        lowerTitle.contains('reset') ||
+        lowerTitle.contains('overwrite');
   }
 
   Future<bool?> _showConfirmationDialog({
@@ -141,14 +189,10 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
           ),
           ElevatedButton(
             style: ElevatedButton.styleFrom(
-              backgroundColor:
-                  title.toLowerCase().contains('delete') ||
-                      title.toLowerCase().contains('reset')
+              backgroundColor: _isDestructiveAction(title)
                   ? Theme.of(context).colorScheme.error
                   : null,
-              foregroundColor:
-                  title.toLowerCase().contains('delete') ||
-                      title.toLowerCase().contains('reset')
+              foregroundColor: _isDestructiveAction(title)
                   ? Theme.of(context).colorScheme.onError
                   : null,
             ),
@@ -162,27 +206,40 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
 
   // === DATA & FILE HANDLING ===
   Future<void> _pickProjectFolder() async {
-    String? selectedDirectory = await FilePicker.platform.getDirectoryPath();
+    String? selectedDirectory = await FilePicker.platform.getDirectoryPath(
+      initialDirectory: _projectFolderPath,
+    );
     if (selectedDirectory != null) {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('project_folder_path', selectedDirectory);
+      await prefs.setString(_projectFolderPathKey, selectedDirectory);
       setState(() {
         _projectFolderPath = selectedDirectory;
         _activePanelIndex = 0;
       });
-      _loadCsvFilesInFolder();
+      await _loadCsvFilesInFolder();
     }
   }
 
   Future<bool> _loadInitialFolder() async {
     final prefs = await SharedPreferences.getInstance();
-    final savedPath = prefs.getString('project_folder_path');
+    final savedPath = prefs.getString(_projectFolderPathKey);
     if (savedPath != null) {
       setState(() => _projectFolderPath = savedPath);
       await _loadCsvFilesInFolder();
       return true;
     }
     return false;
+  }
+
+  void _filterProjectFiles() {
+    final filterText = _projectFilterController.text.toLowerCase();
+    setState(() {
+      _filteredCsvFilesInProject = _csvFilesInProject
+          .where(
+            (file) => p.basename(file.path).toLowerCase().contains(filterText),
+          )
+          .toList();
+    });
   }
 
   Future<void> _loadCsvFilesInFolder() async {
@@ -193,11 +250,10 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
           .list()
           .where((item) => item.path.toLowerCase().endsWith('.csv'))
           .toList();
-      setState(
-        () =>
-            _csvFilesInProject = files
-              ..sort((a, b) => a.path.compareTo(b.path)),
-      );
+      setState(() {
+        _csvFilesInProject = files..sort((a, b) => a.path.compareTo(b.path));
+        _filterProjectFiles();
+      });
     } catch (e) {
       _showSnackbar(
         'Error reading folder: $e. Please choose a different folder.',
@@ -206,13 +262,14 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
     }
   }
 
-  Future<void> _loadFile(File file) async {
+  Future<void> _loadFile(File file, {bool isFromSession = false}) async {
     try {
       final fields = await file
           .openRead()
           .transform(utf8.decoder)
           .transform(const CsvToListConverter(shouldParseNumbers: true))
           .toList();
+
       if (fields.isNotEmpty) {
         setState(() {
           _currentlyLoadedFile = file;
@@ -222,10 +279,14 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
           _treeModel = null;
           _treeProbabilities = null;
           _isEditMode = false;
-          _activePanelIndex = null;
         });
 
         final prefs = await SharedPreferences.getInstance();
+        if (!isFromSession) {
+          await prefs.setString(_lastCsvFileKey, file.path);
+          await prefs.remove(_lastModelFileKey);
+        }
+
         final savedHeaders =
             prefs.getStringList(_globalSelectedColumnsKey) ?? [];
         final selectedIndices = <int>{};
@@ -236,10 +297,19 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
         }
 
         _applyColumnSelection(selectedIndices);
+        if (_labelSettings != null &&
+            _activeLabelSource == LabelSource.fromSettings) {
+          _applyLoadedLabelSettings();
+        }
       }
     } catch (e) {
       _showSnackbar('Error loading file: $e', isError: true);
     }
+  }
+
+  Future<void> _saveShowLabelsPreference() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_showLabelsKey, _showLabels);
   }
 
   void _applyColumnSelection(Set<int> selectedIndices) async {
@@ -253,10 +323,10 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
     setState(() {
       _filteredCsvHeaders = newHeaders;
       _filteredCsvData = newData;
-      _chartData = _prepareChartData(_filteredCsvData!);
-      _originalChartData = _prepareChartData(_filteredCsvData!);
       _labelColumnIndex = null;
       _selectedLabelValue = null;
+      _chartData = _prepareChartData(_filteredCsvData!);
+      _originalChartData = _prepareChartData(_filteredCsvData!);
       _uniqueValuesInLabelColumn = [];
       _treeModel = null;
       _treeProbabilities = null;
@@ -264,6 +334,21 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.setStringList(_globalSelectedColumnsKey, newHeaders);
+
+    if (_labelSettings != null) {
+      final requiredColumn = _labelSettings!['labels']['column_name'] as String;
+      if (!newHeaders.contains(requiredColumn) &&
+          (_showLabels || _activeLabelSource == LabelSource.fromSettings)) {
+        setState(() {
+          _showLabels = false;
+          _activeLabelSource = LabelSource.fromCsv;
+        });
+        await _saveShowLabelsPreference();
+        _showSnackbar(
+          'Labels turned off: Required column "$requiredColumn" was deselected.',
+        );
+      }
+    }
   }
 
   Future<void> _deleteCurrentFile() async {
@@ -276,6 +361,10 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
       try {
         await _currentlyLoadedFile!.delete();
         _showSnackbar('File deleted.');
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.remove(_lastCsvFileKey);
+        await prefs.remove(_lastModelFileKey);
+
         setState(() {
           _currentlyLoadedFile = null;
           _fullCsvData = null;
@@ -286,7 +375,7 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
           _originalChartData = [];
           _activePanelIndex = 0;
         });
-        _loadCsvFilesInFolder();
+        await _loadCsvFilesInFolder();
       } catch (e) {
         _showSnackbar('Error deleting file: $e', isError: true);
       }
@@ -301,10 +390,17 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
       return;
     }
 
-    final editedFilteredData = _convertChartDataBackToFiltered();
+    if (!asNew) {
+      final confirm = await _showConfirmationDialog(
+        title: 'Overwrite File?',
+        content:
+            'This will replace the original file. This action cannot be undone.',
+      );
+      if (confirm != true) return;
+    }
 
-    List<List<dynamic>> fullReconstructedData = [];
-    fullReconstructedData.add(_fullCsvHeaders!);
+    final editedFilteredData = _convertChartDataBackToFiltered();
+    final List<List<dynamic>> fullReconstructedData = [_fullCsvHeaders!];
 
     for (int i = 0; i < _fullCsvData!.length; i++) {
       List<dynamic> newFullRow = List.from(_fullCsvData![i]);
@@ -324,22 +420,15 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
     if (asNew) {
       final originalName = p.basenameWithoutExtension(filePath);
       final timestamp = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
-      final newName = '${originalName}_edited_$timestamp.csv';
-      filePath = p.join(_projectFolderPath!, newName);
-    }
-
-    if (!asNew) {
-      final confirm = await _showConfirmationDialog(
-        title: 'Overwrite File?',
-        content:
-            'This will replace the original file. This action cannot be undone.',
+      filePath = p.join(
+        _projectFolderPath!,
+        '${originalName}_edited_$timestamp.csv',
       );
-      if (confirm != true) return;
     }
 
     await File(filePath).writeAsString(csvString);
     _showSnackbar('File saved successfully to $filePath');
-    _loadCsvFilesInFolder();
+    await _loadCsvFilesInFolder();
   }
 
   List<List<dynamic>> _convertChartDataBackToFiltered() {
@@ -363,7 +452,7 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
       return ChartData(
         index: i,
         label: isLabel ? _selectedLabelValue : null,
-        values: sourceData[i],
+        values: List.from(sourceData[i]),
       );
     });
   }
@@ -372,13 +461,14 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
     final confirm = await _showConfirmationDialog(
       title: "Reset Edits?",
       content:
-          "Are you sure you want to discard all labeling changes for this file?",
+          "Are you sure you want to discard all labeling and normalization changes for this file?",
     );
     if (confirm != true) return;
 
     setState(() {
       _chartData = _originalChartData.map((d) => ChartData.from(d)).toList();
       _treeProbabilities = null;
+      _isNormalizationEnabled = false;
     });
     _showSnackbar('All edits have been reset.');
   }
@@ -398,24 +488,44 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
   }
 
   void _updateLabelColumn(int? newIndexInFilteredList) {
+    final previousValue = _selectedLabelValue;
+
     setState(() {
       _selectedLabelValue = null;
-      _uniqueValuesInLabelColumn = [];
       _labelColumnIndex = newIndexInFilteredList;
 
-      if (newIndexInFilteredList != null) {
-        final uniqueValues = _filteredCsvData!
-            .map((row) => row[newIndexInFilteredList])
-            .toSet()
-            .where((v) => v != null && v.toString().trim().isNotEmpty)
-            .toList();
-        _uniqueValuesInLabelColumn = uniqueValues;
+      if (_activeLabelSource == LabelSource.fromCsv) {
+        _uniqueValuesInLabelColumn = [];
+        if (newIndexInFilteredList != null) {
+          final uniqueValues = _filteredCsvData!
+              .map((row) => row[newIndexInFilteredList])
+              .toSet()
+              .where((v) => v != null && v.toString().trim().isNotEmpty)
+              .toList();
+          _uniqueValuesInLabelColumn = uniqueValues;
 
-        if (_uniqueValuesInLabelColumn.isNotEmpty) {
-          _selectedLabelValue = _uniqueValuesInLabelColumn.first;
+          if (previousValue != null &&
+              _uniqueValuesInLabelColumn.contains(previousValue)) {
+            _selectedLabelValue = previousValue;
+          } else if (_uniqueValuesInLabelColumn.isNotEmpty) {
+            _selectedLabelValue = _uniqueValuesInLabelColumn.first;
+          }
+        }
+      } else {
+        // LabelSource.fromSettings
+        final auto = _autoPickActiveLabelFromSettings();
+        if (auto != null) {
+          _selectedLabelValue = auto;
+        } else if (_selectedActiveLabels.isNotEmpty && _labelSettings != null) {
+          final labelValuesMap = (_labelSettings!['labels']['values'] as Map)
+              .cast<String, dynamic>();
+          _selectedLabelValue = _isLabelColumnNumeric()
+              ? labelValuesMap[_selectedActiveLabels.first]
+              : _selectedActiveLabels.first;
+        } else {
+          _selectedLabelValue = null;
         }
       }
-
       _chartData = _prepareChartData(_filteredCsvData!);
       _originalChartData = _prepareChartData(_filteredCsvData!);
     });
@@ -430,7 +540,48 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
       _markerHeight = prefs.getDouble('chart_marker_height') ?? 4.0;
       _showMarkers = prefs.getBool('chart_show_markers') ?? false;
       _selectedChartType = ChartType.values[prefs.getInt('chart_type') ?? 0];
+      _treeFolderPath = prefs.getString(_treeFolderPathKey);
+      _showLabels = prefs.getBool(_showLabelsKey) ?? true;
+
+      final settingsJsonString = prefs.getString(_labelSettingsKey);
+      if (settingsJsonString != null) {
+        try {
+          _labelSettings = json.decode(settingsJsonString);
+          _activeLabelSource = LabelSource.fromSettings;
+        } catch (e) {
+          debugPrint("Error decoding label settings from prefs: $e");
+          _labelSettings = null;
+        }
+      }
+      final savedLabels = prefs.getStringList(_selectedActiveLabelsKey) ?? [];
+      _selectedActiveLabels.clear();
+      _selectedActiveLabels.addAll(savedLabels);
+
+      if (_activeLabelSource == LabelSource.fromSettings &&
+          _labelSettings != null) {
+        _selectedLabelValue = null;
+      }
     });
+  }
+
+  Future<void> _loadLastSession() async {
+    final prefs = await SharedPreferences.getInstance();
+    final csvPath = prefs.getString(_lastCsvFileKey);
+    final modelPath = prefs.getString(_lastModelFileKey);
+
+    if (csvPath != null) {
+      final csvFile = File(csvPath);
+      if (await csvFile.exists()) {
+        await _loadFile(csvFile, isFromSession: true);
+
+        if (modelPath != null) {
+          final modelFile = File(modelPath);
+          if (await modelFile.exists()) {
+            await _loadTreeModel(modelFile, isFromSession: true);
+          }
+        }
+      }
+    }
   }
 
   Future<void> _savePreferences() async {
@@ -442,13 +593,91 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
     await prefs.setInt('chart_type', _selectedChartType.index);
   }
 
-  // === ML & DIALOGS (REFACTORED FOR TREE MODELS) ===
+  // === LABEL SETTINGS ===
+  Future<void> _loadLabelSettings() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['json'],
+    );
+
+    if (result != null && result.files.single.path != null) {
+      try {
+        final file = File(result.files.single.path!);
+        final jsonString = await file.readAsString();
+        final decodedJson = json.decode(jsonString);
+
+        if (decodedJson is! Map ||
+            decodedJson['labels'] is! Map ||
+            decodedJson['labels']['column_name'] is! String ||
+            decodedJson['labels']['values'] is! Map) {
+          _showSnackbar('Invalid JSON format.', isError: true);
+          return;
+        }
+
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString(_labelSettingsKey, jsonString);
+
+        setState(() {
+          _labelSettings = decodedJson as Map<String, dynamic>;
+          final labelValuesMap = (_labelSettings!['labels']['values'] as Map);
+          _selectedActiveLabels.clear();
+          _selectedActiveLabels.addAll(labelValuesMap.keys.cast<String>());
+          _activeLabelSource = LabelSource.fromSettings;
+
+          final auto = _autoPickActiveLabelFromSettings();
+          if (auto != null) {
+            _selectedLabelValue = auto;
+          } else if (_selectedActiveLabels.isNotEmpty) {
+            _selectedLabelValue = _isLabelColumnNumeric()
+                ? labelValuesMap[_selectedActiveLabels.first]
+                : _selectedActiveLabels.first;
+          } else {
+            _selectedLabelValue = null;
+          }
+        });
+
+        await _saveActiveLabelSelection();
+        _applyLoadedLabelSettings();
+        _showSnackbar('Label settings loaded and saved successfully.');
+      } catch (e) {
+        _showSnackbar('Error reading/parsing settings file: $e', isError: true);
+      }
+    }
+  }
+
+  void _applyLoadedLabelSettings() {
+    if (_labelSettings == null || _filteredCsvHeaders == null) return;
+
+    final String columnName = _labelSettings!['labels']['column_name'];
+    final int targetIndex = _filteredCsvHeaders!.indexOf(columnName);
+
+    if (targetIndex != -1) {
+      _updateLabelColumn(targetIndex);
+    } else {
+      _showSnackbar(
+        'Label column "$columnName" not found in selected CSV columns.',
+        isError: true,
+      );
+    }
+  }
+
+  Future<void> _saveActiveLabelSelection() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(
+      _selectedActiveLabelsKey,
+      _selectedActiveLabels.toList(),
+    );
+  }
+
+  // === ML & DIALOGS ===
   Future<void> _pickTreeFolder() async {
-    String? selectedDirectory = await FilePicker.platform.getDirectoryPath();
+    String? selectedDirectory = await FilePicker.platform.getDirectoryPath(
+      initialDirectory: _treeFolderPath,
+    );
     if (selectedDirectory != null) {
-      setState(() {
-        _treeFolderPath = selectedDirectory;
-      });
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_treeFolderPathKey, selectedDirectory);
+      setState(() => _treeFolderPath = selectedDirectory);
       _loadTreeFilesInFolder();
     }
   }
@@ -469,22 +698,20 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
     }
   }
 
-  Future<void> _loadTreeModel(File file) async {
+  Future<void> _loadTreeModel(File file, {bool isFromSession = false}) async {
     final model = await TreeEnsembleClassifier.fromFile(file);
-
     if (model == null) {
       _showSnackbar('Failed to load or parse the tree model.', isError: true);
       return;
     }
 
-    final modelFeatures = model.featureNames.toSet();
     final csvHeaders = _fullCsvHeaders?.toSet();
-
     if (csvHeaders == null) {
       _showSnackbar('Load a CSV file before loading a model.', isError: true);
       return;
     }
 
+    final modelFeatures = model.featureNames.toSet();
     if (!csvHeaders.containsAll(modelFeatures)) {
       final missingFeatures = modelFeatures.difference(csvHeaders);
       _showSnackbar(
@@ -494,10 +721,12 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
       return;
     }
 
-    setState(() {
-      _treeModel = model;
-    });
+    if (!isFromSession) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_lastModelFileKey, file.path);
+    }
 
+    setState(() => _treeModel = model);
     _showSnackbar('Tree model loaded successfully: ${p.basename(file.path)}');
     _runTreePrediction();
   }
@@ -514,25 +743,17 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
     for (final row in _fullCsvData!) {
       try {
         List<double> fullFeatureRow = List.generate(expectedColumnCount, (i) {
-          if (i >= row.length) {
-            return 0.0;
-          }
+          if (i >= row.length) return 0.0;
           final value = row[i];
           return (value is num) ? value.toDouble() : 0.0;
         }, growable: false);
-
-        final proba = _treeModel!.predict(fullFeatureRow);
-        probabilities.add(proba);
+        probabilities.add(_treeModel!.predict(fullFeatureRow));
       } catch (e) {
         probabilities.add(0.0);
         debugPrint('Could not process row due to an unexpected error: $e');
       }
     }
-
-    setState(() {
-      _treeProbabilities = probabilities;
-    });
-
+    setState(() => _treeProbabilities = probabilities);
     _showSnackbar('Tree model prediction complete.');
   }
 
@@ -545,9 +766,8 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
     final confirm = await _showConfirmationDialog(
       title: 'Apply Auto-Labels?',
       content:
-          'This will add labels above ${(_autoLabelAddThreshold * 100).toStringAsFixed(0)}% and remove labels below ${(_autoLabelRemoveThreshold * 100).toStringAsFixed(0)}%. This action cannot be undone.',
+          'This will add labels above ${(_autoLabelAddThreshold * 100).toStringAsFixed(0)}% and remove labels below ${(_autoLabelRemoveThreshold * 100).toStringAsFixed(0)}%. This action is permanent until reset.',
     );
-
     if (confirm != true) return;
 
     int labelsAdded = 0;
@@ -602,124 +822,226 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
     );
 
     if (newWidth != null) {
-      setState(() {
-        _lineWidth = newWidth;
-      });
+      setState(() => _lineWidth = newWidth);
       await _savePreferences();
     }
   }
 
+  bool _isLabelColumnNumeric() {
+    if (_filteredCsvData == null || _labelColumnIndex == null) return true;
+    for (final row in _filteredCsvData!) {
+      final v = row[_labelColumnIndex!];
+      if (v != null) return v is num;
+    }
+    return true;
+  }
+
+  dynamic _autoPickActiveLabelFromSettings() {
+    if (_labelSettings == null ||
+        _filteredCsvData == null ||
+        _labelColumnIndex == null) {
+      return null;
+    }
+
+    final Map<String, dynamic> labelValuesMap =
+        (_labelSettings!['labels']['values'] as Map).cast<String, dynamic>();
+    final selectedNames = _selectedActiveLabels.toSet();
+    if (selectedNames.isEmpty) return null;
+
+    final bool numericCol = _isLabelColumnNumeric();
+    final Map<dynamic, int> counts = {};
+
+    for (final row in _filteredCsvData!) {
+      final v = row[_labelColumnIndex!];
+      if (v == null) continue;
+
+      if (numericCol) {
+        for (final name in selectedNames) {
+          final mapped = labelValuesMap[name];
+          if (mapped == v) {
+            counts[mapped] = (counts[mapped] ?? 0) + 1;
+          }
+        }
+      } else if (v is String && selectedNames.contains(v)) {
+        counts[v] = (counts[v] ?? 0) + 1;
+      }
+    }
+
+    if (counts.isEmpty) return null;
+    return counts.entries.reduce((a, b) => a.value >= b.value ? a : b).key;
+  }
+
   // === CHART SERIES CREATION ===
   List<CartesianSeries<dynamic, int>> _createSeries() {
-    List<CartesianSeries<dynamic, int>> series = [];
-    if (_filteredCsvHeaders == null) return series;
+    if (_filteredCsvHeaders == null) return [];
 
-    if (_labelColumnIndex != null && _selectedLabelValue != null) {
+    List<ChartData> dataSource = _chartData;
+
+    if (_isNormalizationEnabled) {
+      final Map<int, double> maxValues = {};
+      final numericColumnIndices = <int>{};
+
+      for (int i = 0; i < _filteredCsvHeaders!.length; i++) {
+        if (i == _labelColumnIndex) continue;
+        if (_chartData.isNotEmpty && _chartData.first.values[i] is num) {
+          numericColumnIndices.add(i);
+          double maxVal = 0.0;
+          for (final dataPoint in _chartData) {
+            final val = dataPoint.values[i];
+            if (val is num && val.abs() > maxVal) {
+              maxVal = val.abs().toDouble();
+            }
+          }
+          maxValues[i] = maxVal;
+        }
+      }
+
+      dataSource = _chartData.map((dataPoint) {
+        final newValues = List.from(dataPoint.values);
+        for (int colIdx in numericColumnIndices) {
+          final maxVal = maxValues[colIdx]!;
+          final targetMax = maxVal * _normalizationPercentile;
+          if (targetMax > 0 && newValues[colIdx] is num) {
+            newValues[colIdx] = newValues[colIdx] / targetMax;
+          }
+        }
+        return ChartData(
+          index: dataPoint.index,
+          label: dataPoint.label,
+          values: newValues,
+        );
+      }).toList();
+    }
+
+    List<CartesianSeries<dynamic, int>> series = [];
+
+    if (_showLabels &&
+        _labelColumnIndex != null &&
+        _selectedLabelValue != null) {
       series.add(
         ColumnSeries<ChartData, int>(
-          dataSource: _chartData,
+          dataSource: dataSource,
           xValueMapper: (d, _) => d.index,
           yValueMapper: (d, _) => d.label != null ? 1 : 0,
           name: 'Event: $_selectedLabelValue',
           yAxisName: 'eventAxis',
           width: 1,
           onPointTap: _editDataPoint,
+          animationDuration: 0, // <-- Add this line
         ),
       );
     }
 
     for (int i = 0; i < _filteredCsvHeaders!.length; i++) {
       if (i == _labelColumnIndex) continue;
-      series.add(_getSeriesType(i, _filteredCsvHeaders![i]));
+      series.add(_getSeriesType(i, _filteredCsvHeaders![i], dataSource));
     }
 
     if (_showProbabilities && _treeProbabilities != null) {
-      series.add(
-        LineSeries<double, int>(
-          dataSource: _treeProbabilities!,
-          xValueMapper: (score, index) => index,
-          yValueMapper: (score, _) => score,
-          name: 'Tree Probability',
-          yAxisName: 'similarityAxis',
-          color: Colors.amber,
-          width: 2,
-          dashArray: const <double>[5, 5],
-        ),
-      );
+      if (_probabilityChartTypeIsBar) {
+        series.add(
+          ColumnSeries<double, int>(
+            dataSource: _treeProbabilities!,
+            xValueMapper: (score, index) => index,
+            yValueMapper: (score, _) => score,
+            name: 'Tree Probability',
+            yAxisName: 'similarityAxis',
+            color: Colors.green.withOpacity(_probabilityOpacity),
+            width: 1,
+          ),
+        );
+      } else {
+        series.add(
+          LineSeries<double, int>(
+            dataSource: _treeProbabilities!,
+            xValueMapper: (score, index) => index,
+            yValueMapper: (score, _) => score,
+            name: 'Tree Probability',
+            yAxisName: 'similarityAxis',
+            color: Colors.green.withOpacity(_probabilityOpacity),
+            width: 2,
+            dashArray: const <double>[5, 5],
+          ),
+        );
+      }
     }
-
     return series;
   }
 
-  CartesianSeries<ChartData, int> _getSeriesType(int index, String header) {
-    final commonProperties = {
-      'dataSource': _chartData,
-      'xValueMapper': (ChartData data, _) => data.index,
-      'yValueMapper': (ChartData data, _) {
-        final val = data.values[index];
-        return (val is num) ? val.toDouble() : 0.0;
-      },
+  // === REFACTORED METHOD ===
+  // This method is now much cleaner, defining common properties only once
+  // and using the switch statement just to select the series class.
+  CartesianSeries<ChartData, int> _getSeriesType(
+    int index,
+    String header,
+    List<ChartData> dataSource,
+  ) {
+    final ChartValueMapper<ChartData, int> xValueMapper = (d, _) => d.index;
+    final ChartValueMapper<ChartData, num> yValueMapper = (d, _) {
+      final val = d.values[index];
+      return (val is num) ? val.toDouble() : 0.0;
+    };
+    final MarkerSettings markerSettings = _showMarkers
+        ? MarkerSettings(
+            isVisible: true,
+            height: _markerHeight,
+            width: _markerWidth,
+          )
+        : const MarkerSettings(isVisible: false);
+
+    final seriesProps = {
       'name': header,
-      'animationDuration': 0.0,
+      'dataSource': dataSource,
+      'xValueMapper': xValueMapper,
+      'yValueMapper': yValueMapper,
       'width': _lineWidth,
       'onPointTap': _editDataPoint,
-      'markerSettings': _showMarkers
-          ? MarkerSettings(
-              isVisible: true,
-              height: _markerHeight,
-              width: _markerWidth,
-            )
-          : const MarkerSettings(isVisible: false),
+      'markerSettings': markerSettings,
+      'animationDuration': 0.0,
     };
 
     switch (_selectedChartType) {
       case ChartType.spline:
         return SplineSeries<ChartData, int>(
-          dataSource: commonProperties['dataSource'] as List<ChartData>,
+          name: seriesProps['name'] as String,
+          dataSource: seriesProps['dataSource'] as List<ChartData>,
           xValueMapper:
-              commonProperties['xValueMapper']
-                  as ChartValueMapper<ChartData, int>,
+              seriesProps['xValueMapper'] as ChartValueMapper<ChartData, int>,
           yValueMapper:
-              commonProperties['yValueMapper']
-                  as ChartValueMapper<ChartData, num>,
-          name: commonProperties['name'] as String,
-          animationDuration: commonProperties['animationDuration'] as double,
-          width: commonProperties['width'] as double,
+              seriesProps['yValueMapper'] as ChartValueMapper<ChartData, num>,
+          width: seriesProps['width'] as double,
           onPointTap:
-              commonProperties['onPointTap'] as ChartPointInteractionCallback,
-          markerSettings: commonProperties['markerSettings'] as MarkerSettings,
+              seriesProps['onPointTap'] as ChartPointInteractionCallback,
+          markerSettings: seriesProps['markerSettings'] as MarkerSettings,
+          animationDuration: seriesProps['animationDuration'] as double,
         );
       case ChartType.stepLine:
         return StepLineSeries<ChartData, int>(
-          dataSource: commonProperties['dataSource'] as List<ChartData>,
+          name: seriesProps['name'] as String,
+          dataSource: seriesProps['dataSource'] as List<ChartData>,
           xValueMapper:
-              commonProperties['xValueMapper']
-                  as ChartValueMapper<ChartData, int>,
+              seriesProps['xValueMapper'] as ChartValueMapper<ChartData, int>,
           yValueMapper:
-              commonProperties['yValueMapper']
-                  as ChartValueMapper<ChartData, num>,
-          name: commonProperties['name'] as String,
-          animationDuration: commonProperties['animationDuration'] as double,
-          width: commonProperties['width'] as double,
+              seriesProps['yValueMapper'] as ChartValueMapper<ChartData, num>,
+          width: seriesProps['width'] as double,
           onPointTap:
-              commonProperties['onPointTap'] as ChartPointInteractionCallback,
-          markerSettings: commonProperties['markerSettings'] as MarkerSettings,
+              seriesProps['onPointTap'] as ChartPointInteractionCallback,
+          markerSettings: seriesProps['markerSettings'] as MarkerSettings,
+          animationDuration: seriesProps['animationDuration'] as double,
         );
-      default:
+      default: // ChartType.line
         return LineSeries<ChartData, int>(
-          dataSource: commonProperties['dataSource'] as List<ChartData>,
+          name: seriesProps['name'] as String,
+          dataSource: seriesProps['dataSource'] as List<ChartData>,
           xValueMapper:
-              commonProperties['xValueMapper']
-                  as ChartValueMapper<ChartData, int>,
+              seriesProps['xValueMapper'] as ChartValueMapper<ChartData, int>,
           yValueMapper:
-              commonProperties['yValueMapper']
-                  as ChartValueMapper<ChartData, num>,
-          name: commonProperties['name'] as String,
-          animationDuration: commonProperties['animationDuration'] as double,
-          width: commonProperties['width'] as double,
+              seriesProps['yValueMapper'] as ChartValueMapper<ChartData, num>,
+          width: seriesProps['width'] as double,
           onPointTap:
-              commonProperties['onPointTap'] as ChartPointInteractionCallback,
-          markerSettings: commonProperties['markerSettings'] as MarkerSettings,
+              seriesProps['onPointTap'] as ChartPointInteractionCallback,
+          markerSettings: seriesProps['markerSettings'] as MarkerSettings,
+          animationDuration: seriesProps['animationDuration'] as double,
         );
     }
   }
@@ -769,7 +1091,12 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
                 label: const Text('Columns'),
               ),
               NavigationRailDestination(
-                icon: const Icon(Icons.computer, color: Colors.amber),
+                icon: const Icon(Icons.label_outline),
+                disabled: _fullCsvData == null,
+                label: const Text('Labels'),
+              ),
+              NavigationRailDestination(
+                icon: const Icon(Icons.computer),
                 disabled: _currentlyLoadedFile == null,
                 label: const Text('ML Tools'),
               ),
@@ -786,6 +1113,11 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
                 label: const Text("Edit"),
               ),
               NavigationRailDestination(
+                icon: const Icon(Icons.equalizer),
+                disabled: _chartData.isEmpty,
+                label: const Text("Normalize"),
+              ),
+              NavigationRailDestination(
                 icon: const Icon(Icons.search),
                 disabled: _chartData.isEmpty,
                 label: const Text("Zoom"),
@@ -793,7 +1125,7 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
               NavigationRailDestination(
                 icon: const Icon(Icons.tune_outlined),
                 disabled: _chartData.isEmpty,
-                label: const Text('Plot Settings'),
+                label: const Text('Plot'),
               ),
             ],
           ),
@@ -808,20 +1140,34 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
     final panelBuilders = {
       0: _buildExplorerView,
       1: _buildColumnSelectorPanel,
-      2: _buildMlPanel,
-      3: _buildFilePanel,
-      4: _buildEditPanel,
-      5: _buildZoomPanel,
-      6: _buildPlotSettingsPanel,
+      2: _buildLabelPanel,
+      3: _buildMlPanel,
+      4: _buildFilePanel,
+      5: _buildEditPanel,
+      6: _buildNormalizePanel,
+      7: _buildZoomPanel,
+      8: _buildPlotSettingsPanel,
     };
-
     final activePanelBuilder = panelBuilders[_activePanelIndex];
 
     return Row(
       children: [
         if (activePanelBuilder != null)
-          SizedBox(width: 300, child: activePanelBuilder()),
-        if (activePanelBuilder != null) const VerticalDivider(width: 1),
+          SizedBox(width: _panelWidth, child: activePanelBuilder()),
+        if (activePanelBuilder != null)
+          MouseRegion(
+            cursor: SystemMouseCursors.resizeLeftRight,
+            child: GestureDetector(
+              onHorizontalDragUpdate: (details) {
+                setState(() {
+                  _panelWidth += details.delta.dx;
+                  if (_panelWidth < 250) _panelWidth = 250;
+                  if (_panelWidth > 600) _panelWidth = 600;
+                });
+              },
+              child: const VerticalDivider(width: 8, thickness: 10),
+            ),
+          ),
         Expanded(
           child: (_currentlyLoadedFile != null)
               ? _buildChartView()
@@ -832,388 +1178,650 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
   }
 
   // --- SIDE PANELS ---
-
   Widget _buildFilePanel() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: Text(
-            'File Options',
-            style: Theme.of(context).textTheme.titleLarge,
+    return _SidePanelTemplate(
+      title: 'File Options',
+      child: ListView(
+        padding: const EdgeInsets.all(8),
+        children: [
+          ListTile(
+            leading: const Icon(Icons.save),
+            title: const Text('Save'),
+            onTap: () => _saveFile(asNew: false),
           ),
-        ),
-        const Divider(height: 1),
-        Expanded(
-          child: ListView(
-            padding: const EdgeInsets.all(8),
-            children: [
-              ListTile(
-                leading: const Icon(Icons.save),
-                title: const Text('Save'),
-                onTap: () => _saveFile(asNew: false),
-              ),
-              ListTile(
-                leading: const Icon(Icons.save_as),
-                title: const Text('Save As...'),
-                onTap: () => _saveFile(asNew: true),
-              ),
-              const Divider(),
-              ListTile(
-                leading: Icon(
-                  Icons.delete_forever,
-                  color: Theme.of(context).colorScheme.error,
-                ),
-                title: Text(
-                  'Delete File',
-                  style: TextStyle(color: Theme.of(context).colorScheme.error),
-                ),
-                onTap: _deleteCurrentFile,
-              ),
-            ],
+          ListTile(
+            leading: const Icon(Icons.save_as),
+            title: const Text('Save As...'),
+            onTap: () => _saveFile(asNew: true),
           ),
-        ),
-      ],
+          const Divider(),
+          ListTile(
+            leading: Icon(
+              Icons.delete_forever,
+              color: Theme.of(context).colorScheme.error,
+            ),
+            title: Text(
+              'Delete File',
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            ),
+            onTap: _deleteCurrentFile,
+          ),
+        ],
+      ),
     );
   }
 
   Widget _buildEditPanel() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: Text(
-            'Editing Tools',
-            style: Theme.of(context).textTheme.titleLarge,
+    return _SidePanelTemplate(
+      title: 'Editing Tools',
+      child: ListView(
+        shrinkWrap: true,
+        padding: const EdgeInsets.all(8),
+        children: [
+          SwitchListTile(
+            secondary: Icon(_isEditMode ? Icons.edit_off : Icons.edit),
+            title: const Text('Enable Edit Mode'),
+            value: _isEditMode,
+            onChanged: (value) => setState(() => _isEditMode = value),
           ),
-        ),
-        const Divider(height: 1),
-        ListView(
-          shrinkWrap: true,
-          padding: const EdgeInsets.all(8),
-          children: [
-            SwitchListTile(
-              secondary: Icon(_isEditMode ? Icons.edit_off : Icons.edit),
-              title: const Text('Enable Edit Mode'),
-              value: _isEditMode,
-              onChanged: (value) => setState(() => _isEditMode = value),
+          const Divider(),
+          ListTile(
+            leading: Icon(
+              Icons.restore,
+              color: Theme.of(context).colorScheme.error,
             ),
-            const Divider(),
-            ListTile(
-              leading: Icon(
-                Icons.restore,
-                color: Theme.of(context).colorScheme.error,
+            title: Text(
+              'Reset All Edits',
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            ),
+            onTap: _resetChartEdits,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLabelPanel() {
+    final Map<String, dynamic> labelValuesMap =
+        (_labelSettings?['labels']?['values'] as Map?)
+            ?.cast<String, dynamic>() ??
+        {};
+    final String? requiredColumn = _labelSettings?['labels']?['column_name'];
+    final bool isLabelColumnAvailable =
+        requiredColumn != null &&
+        _filteredCsvHeaders != null &&
+        _filteredCsvHeaders!.contains(requiredColumn);
+    final bool canUseSettingsSource =
+        _labelSettings != null && isLabelColumnAvailable;
+    final bool labelColumnIsNumeric = _isLabelColumnNumeric();
+
+    return _SidePanelTemplate(
+      title: 'Label Settings',
+      child: ListView(
+        padding: const EdgeInsets.all(16.0),
+        children: [
+          SwitchListTile(
+            title: const Text('Show Labels on Chart'),
+            value: _showLabels,
+            onChanged: (value) {
+              setState(() {
+                _showLabels = value;
+                if (value == true &&
+                    _labelColumnIndex == null &&
+                    _filteredCsvHeaders != null) {
+                  int defaultIndex = _filteredCsvHeaders!.indexWhere(
+                    (h) => h.toLowerCase().contains('label'),
+                  );
+                  if (defaultIndex != -1) {
+                    _updateLabelColumn(defaultIndex);
+                  }
+                }
+              });
+              _saveShowLabelsPreference();
+            },
+          ),
+          const Divider(),
+          ListTile(
+            leading: const Icon(Icons.settings_suggest),
+            title: const Text('Load Settings File'),
+            subtitle: const Text('Import labels from a .json file'),
+            onTap: _loadLabelSettings,
+          ),
+          const Divider(height: 24),
+          const Text(
+            'Label Source',
+            style: TextStyle(fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          SegmentedButton<LabelSource>(
+            segments: const [
+              ButtonSegment(
+                value: LabelSource.fromCsv,
+                label: Text('From Data'),
               ),
-              title: Text(
-                'Reset All Edits',
-                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ButtonSegment(
+                value: LabelSource.fromSettings,
+                label: Text('From Settings'),
               ),
-              onTap: _resetChartEdits,
+            ],
+            selected: {_activeLabelSource},
+            onSelectionChanged: (newSelection) {
+              final selectedSource = newSelection.first;
+              if (selectedSource == LabelSource.fromSettings &&
+                  !canUseSettingsSource) {
+                _showSnackbar(
+                  'Cannot use settings: Required column "$requiredColumn" is not selected.',
+                  isError: true,
+                );
+                return;
+              }
+              setState(() {
+                _activeLabelSource = selectedSource;
+                if (_activeLabelSource == LabelSource.fromSettings) {
+                  final auto = _autoPickActiveLabelFromSettings();
+                  if (auto != null) {
+                    _selectedLabelValue = auto;
+                  } else if (_selectedActiveLabels.isNotEmpty &&
+                      _labelSettings != null) {
+                    _selectedLabelValue = _isLabelColumnNumeric()
+                        ? labelValuesMap[_selectedActiveLabels.first]
+                        : _selectedActiveLabels.first;
+                  } else {
+                    _selectedLabelValue = null;
+                  }
+                } else {
+                  _updateLabelColumn(_labelColumnIndex);
+                }
+                _chartData = _prepareChartData(_filteredCsvData!);
+                _originalChartData = _prepareChartData(_filteredCsvData!);
+              });
+            },
+          ),
+          const SizedBox(height: 16),
+          const Text(
+            'Label Column',
+            style: TextStyle(fontWeight: FontWeight.bold),
+          ),
+          (_activeLabelSource == LabelSource.fromSettings &&
+                  _labelSettings != null)
+              ? ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: const Icon(Icons.lock_outline),
+                  title: Text(requiredColumn ?? "Error"),
+                  subtitle: const Text('Defined by settings file'),
+                )
+              : DropdownButton<int>(
+                  isExpanded: true,
+                  value: _labelColumnIndex,
+                  hint: const Text('Choose column for labels'),
+                  items:
+                      _filteredCsvHeaders
+                          ?.asMap()
+                          .entries
+                          .map(
+                            (entry) => DropdownMenuItem<int>(
+                              value: entry.key,
+                              child: Text(entry.value),
+                            ),
+                          )
+                          .toList() ??
+                      [],
+                  onChanged: _updateLabelColumn,
+                ),
+          const SizedBox(height: 16),
+          const Text(
+            'Active Label Value (for Editing)',
+            style: TextStyle(fontWeight: FontWeight.bold),
+          ),
+          DropdownButton<dynamic>(
+            isExpanded: true,
+            value: _selectedLabelValue,
+            hint: const Text('Select value to apply'),
+            items:
+                (_activeLabelSource == LabelSource.fromSettings &&
+                    _labelSettings != null)
+                ? _selectedActiveLabels.map((labelName) {
+                    final mapped = labelValuesMap[labelName];
+                    return DropdownMenuItem<dynamic>(
+                      value: labelColumnIsNumeric ? mapped : labelName,
+                      child: Text(labelName),
+                    );
+                  }).toList()
+                : _uniqueValuesInLabelColumn.map((value) {
+                    return DropdownMenuItem<dynamic>(
+                      value: value,
+                      child: Text(value.toString()),
+                    );
+                  }).toList(),
+            onChanged: (newValue) => setState(() {
+              _selectedLabelValue = newValue;
+              _treeProbabilities = null;
+              _chartData = _prepareChartData(_filteredCsvData!);
+              _originalChartData = _prepareChartData(_filteredCsvData!);
+            }),
+          ),
+          if (_activeLabelSource == LabelSource.fromSettings &&
+              _labelSettings != null) ...[
+            const Divider(height: 24),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  'Selectable Labels',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+                Row(
+                  children: [
+                    TextButton(
+                      child: const Text('All'),
+                      onPressed: () {
+                        setState(() {
+                          _selectedActiveLabels.addAll(labelValuesMap.keys);
+                          // Re-pick the best label
+                          final auto = _autoPickActiveLabelFromSettings();
+                          _selectedLabelValue =
+                              auto ??
+                              (_selectedActiveLabels.isNotEmpty
+                                  ? (_isLabelColumnNumeric()
+                                        ? labelValuesMap[_selectedActiveLabels
+                                              .first]
+                                        : _selectedActiveLabels.first)
+                                  : null);
+                          if (_filteredCsvData != null) {
+                            _chartData = _prepareChartData(_filteredCsvData!);
+                            _originalChartData = _prepareChartData(
+                              _filteredCsvData!,
+                            );
+                          }
+                        });
+                        _saveActiveLabelSelection();
+                      },
+                    ),
+                    TextButton(
+                      child: const Text('None'),
+                      onPressed: () {
+                        setState(() {
+                          _selectedActiveLabels.clear();
+                          _selectedLabelValue = null;
+                          if (_filteredCsvData != null) {
+                            _chartData = _prepareChartData(_filteredCsvData!);
+                            _originalChartData = _prepareChartData(
+                              _filteredCsvData!,
+                            );
+                          }
+                        });
+                        _saveActiveLabelSelection();
+                      },
+                    ),
+                  ],
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 300),
+              child: ListView(
+                shrinkWrap: true,
+                children: labelValuesMap.keys.map((String labelName) {
+                  return CheckboxListTile(
+                    title: Text(labelName),
+                    value: _selectedActiveLabels.contains(labelName),
+                    onChanged: (bool? value) {
+                      setState(() {
+                        if (value == true) {
+                          _selectedActiveLabels.add(labelName);
+                        } else {
+                          _selectedActiveLabels.remove(labelName);
+                        }
+                        // Re-pick the best label
+                        final auto = _autoPickActiveLabelFromSettings();
+                        _selectedLabelValue =
+                            auto ??
+                            (_selectedActiveLabels.isNotEmpty
+                                ? (_isLabelColumnNumeric()
+                                      ? labelValuesMap[_selectedActiveLabels
+                                            .first]
+                                      : _selectedActiveLabels.first)
+                                : null);
+
+                        if (_filteredCsvData != null) {
+                          _chartData = _prepareChartData(_filteredCsvData!);
+                          _originalChartData = _prepareChartData(
+                            _filteredCsvData!,
+                          );
+                        }
+                      });
+                      _saveActiveLabelSelection();
+                    },
+                  );
+                }).toList(),
+              ),
             ),
           ],
-        ),
-      ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildNormalizePanel() {
+    return _SidePanelTemplate(
+      title: 'Normalize Data',
+      child: ListView(
+        padding: const EdgeInsets.all(16.0),
+        children: [
+          SwitchListTile(
+            title: const Text('Enable Normalization'),
+            value: _isNormalizationEnabled,
+            onChanged: (value) =>
+                setState(() => _isNormalizationEnabled = value),
+          ),
+          const SizedBox(height: 16),
+          if (_isNormalizationEnabled)
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Target Percentile',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+                const SizedBox(height: 8),
+                SegmentedButton<double>(
+                  segments: const [
+                    ButtonSegment(value: 1.0, label: Text('P100')),
+                    ButtonSegment(value: 0.95, label: Text('P95')),
+                    ButtonSegment(value: 0.75, label: Text('P75')),
+                  ],
+                  selected: {_normalizationPercentile},
+                  onSelectionChanged: (newSelection) => setState(
+                    () => _normalizationPercentile = newSelection.first,
+                  ),
+                ),
+              ],
+            ),
+        ],
+      ),
     );
   }
 
   Widget _buildZoomPanel() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: Text(
-            'Zoom Controls',
-            style: Theme.of(context).textTheme.titleLarge,
+    return _SidePanelTemplate(
+      title: 'Zoom Controls',
+      child: ListView(
+        padding: const EdgeInsets.all(8),
+        children: [
+          ListTile(
+            leading: const Icon(Icons.zoom_in),
+            title: const Text('Zoom In'),
+            onTap: () => _zoomPanBehavior.zoomIn(),
           ),
-        ),
-        const Divider(height: 1),
-        Expanded(
-          child: ListView(
-            padding: const EdgeInsets.all(8),
-            children: [
-              ListTile(
-                leading: const Icon(Icons.zoom_in),
-                title: const Text('Zoom In'),
-                onTap: () => _zoomPanBehavior.zoomIn(),
-              ),
-              ListTile(
-                leading: const Icon(Icons.zoom_out),
-                title: const Text('Zoom Out'),
-                onTap: () => _zoomPanBehavior.zoomOut(),
-              ),
-              ListTile(
-                leading: const Icon(Icons.refresh),
-                title: const Text('Reset Zoom'),
-                onTap: () => _zoomPanBehavior.reset(),
-              ),
-            ],
+          ListTile(
+            leading: const Icon(Icons.zoom_out),
+            title: const Text('Zoom Out'),
+            onTap: () => _zoomPanBehavior.zoomOut(),
           ),
-        ),
-      ],
+          ListTile(
+            leading: const Icon(Icons.refresh),
+            title: const Text('Reset Zoom'),
+            onTap: () => _zoomPanBehavior.reset(),
+          ),
+        ],
+      ),
     );
   }
 
   Widget _buildPlotSettingsPanel() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: Text(
-            'Plot Settings',
-            style: Theme.of(context).textTheme.titleLarge,
-          ),
-        ),
-        const Divider(height: 1),
-        Expanded(
-          child: ListView(
-            padding: const EdgeInsets.all(16),
-            children: [
-              Text(
-                'Chart Type',
-                style: Theme.of(context).textTheme.titleMedium,
+    return _SidePanelTemplate(
+      title: 'Plot Settings',
+      child: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Text('Chart Type', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          SegmentedButton<ChartType>(
+            segments: const [
+              ButtonSegment(
+                value: ChartType.line,
+                label: Text('Line'),
+                icon: Icon(Icons.show_chart),
               ),
-              const SizedBox(height: 8),
-              SegmentedButton<ChartType>(
-                segments: const [
-                  ButtonSegment(
-                    value: ChartType.line,
-                    label: Text('Line'),
-                    icon: Icon(Icons.show_chart),
-                  ),
-                  ButtonSegment(
-                    value: ChartType.spline,
-                    label: Text('Spline'),
-                    icon: Icon(Icons.gesture),
-                  ),
-                  ButtonSegment(
-                    value: ChartType.stepLine,
-                    label: Text('Step'),
-                    icon: Icon(Icons.stairs),
-                  ),
-                ],
-                selected: {_selectedChartType},
-                onSelectionChanged: (newSelection) {
-                  setState(() => _selectedChartType = newSelection.first);
-                  _savePreferences();
-                },
+              ButtonSegment(
+                value: ChartType.spline,
+                label: Text('Spline'),
+                icon: Icon(Icons.gesture),
               ),
-              const Divider(height: 24),
-              ListTile(
-                contentPadding: EdgeInsets.zero,
-                title: const Text('Line Width'),
-                subtitle: Text(_lineWidth.toStringAsFixed(1)),
-                trailing: IconButton(
-                  icon: const Icon(Icons.edit),
-                  onPressed: _showLineWidthDialog,
-                ),
+              ButtonSegment(
+                value: ChartType.stepLine,
+                label: Text('Step'),
+                icon: Icon(Icons.stairs),
               ),
-              Slider(
-                value: _lineWidth,
-                min: 0.5,
-                max: 5.0,
-                divisions: 9,
-                label: _lineWidth.toStringAsFixed(1),
-                onChanged: (value) {
-                  setState(() => _lineWidth = value);
-                },
-                onChangeEnd: (value) => _savePreferences(),
-              ),
-              const Divider(height: 24),
-              SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                title: const Text('Show Markers'),
-                value: _showMarkers,
-                onChanged: (value) {
-                  setState(() => _showMarkers = value);
-                  _savePreferences();
-                },
-              ),
-              if (_showMarkers) ...[
-                const SizedBox(height: 8),
-                Text('Marker Width: ${_markerWidth.toStringAsFixed(1)}'),
-                Slider(
-                  value: _markerWidth,
-                  min: 1,
-                  max: 20,
-                  divisions: 19,
-                  label: _markerWidth.toStringAsFixed(1),
-                  onChanged: (value) => setState(() => _markerWidth = value),
-                  onChangeEnd: (value) => _savePreferences(),
-                ),
-                Text('Marker Height: ${_markerHeight.toStringAsFixed(1)}'),
-                Slider(
-                  value: _markerHeight,
-                  min: 1,
-                  max: 20,
-                  divisions: 19,
-                  label: _markerHeight.toStringAsFixed(1),
-                  onChanged: (value) => setState(() => _markerHeight = value),
-                  onChangeEnd: (value) => _savePreferences(),
-                ),
-              ],
             ],
+            selected: {_selectedChartType},
+            onSelectionChanged: (newSelection) {
+              setState(() => _selectedChartType = newSelection.first);
+              _savePreferences();
+            },
           ),
-        ),
-      ],
+          const Divider(height: 24),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Line Width'),
+            subtitle: Text(_lineWidth.toStringAsFixed(1)),
+            trailing: IconButton(
+              icon: const Icon(Icons.edit),
+              onPressed: _showLineWidthDialog,
+            ),
+          ),
+          Slider(
+            value: _lineWidth,
+            min: 0.5,
+            max: 5.0,
+            divisions: 9,
+            label: _lineWidth.toStringAsFixed(1),
+            onChanged: (value) => setState(() => _lineWidth = value),
+            onChangeEnd: (value) => _savePreferences(),
+          ),
+          const Divider(height: 24),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Show Markers'),
+            value: _showMarkers,
+            onChanged: (value) {
+              setState(() => _showMarkers = value);
+              _savePreferences();
+            },
+          ),
+          if (_showMarkers) ...[
+            const SizedBox(height: 8),
+            Text('Marker Width: ${_markerWidth.toStringAsFixed(1)}'),
+            Slider(
+              value: _markerWidth,
+              min: 1,
+              max: 20,
+              divisions: 19,
+              label: _markerWidth.toStringAsFixed(1),
+              onChanged: (value) => setState(() => _markerWidth = value),
+              onChangeEnd: (value) => _savePreferences(),
+            ),
+            Text('Marker Height: ${_markerHeight.toStringAsFixed(1)}'),
+            Slider(
+              value: _markerHeight,
+              min: 1,
+              max: 20,
+              divisions: 19,
+              label: _markerHeight.toStringAsFixed(1),
+              onChanged: (value) => setState(() => _markerHeight = value),
+              onChangeEnd: (value) => _savePreferences(),
+            ),
+          ],
+        ],
+      ),
     );
   }
 
   Widget _buildMlPanel() {
+    String formatMetadataValue(dynamic value) {
+      if (value is Map)
+        return const JsonEncoder.withIndent('  ').convert(value);
+      return value.toString();
+    }
+
     final bool canAutoLabel =
         _labelColumnIndex != null &&
         _selectedLabelValue != null &&
         _treeProbabilities != null;
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: Text(
-            'Tree Model Tools',
-            style: Theme.of(context).textTheme.titleLarge,
-          ),
-        ),
-        const Divider(height: 1),
-        Expanded(
-          child: ListView(
-            padding: const EdgeInsets.all(16.0),
+    return _SidePanelTemplate(
+      title: 'Tree Model Tools',
+      child: ListView(
+        padding: const EdgeInsets.all(16.0),
+        children: [
+          ExpansionTile(
+            title: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text('Tree Models'),
+                Tooltip(
+                  message: 'Select folder containing .json models',
+                  child: IconButton(
+                    icon: const Icon(Icons.folder_open_outlined),
+                    onPressed: _pickTreeFolder,
+                  ),
+                ),
+              ],
+            ),
+            initiallyExpanded: true,
             children: [
-              ExpansionTile(
-                title: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text('Tree Models'),
-                    Tooltip(
-                      message: 'Select folder containing .json models',
-                      child: IconButton(
-                        icon: const Icon(Icons.folder_open_outlined),
-                        onPressed: _pickTreeFolder,
-                      ),
-                    ),
-                  ],
+              if (_treeFilesInFolder.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.all(8.0),
+                  child: Text(
+                    'No folder selected or no .json files found.',
+                    textAlign: TextAlign.center,
+                  ),
+                )
+              else
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxHeight: 200),
+                  child: ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: _treeFilesInFolder.length,
+                    itemBuilder: (context, index) {
+                      final file = _treeFilesInFolder[index];
+                      return ListTile(
+                        leading: const Icon(Icons.insights),
+                        title: Text(
+                          p.basename(file.path),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        selected: _treeModel?.sourcePath == file.path,
+                        onTap: () => _loadTreeModel(file as File),
+                      );
+                    },
+                  ),
                 ),
-                initiallyExpanded: true,
-                children: [
-                  if (_treeFilesInFolder.isEmpty)
-                    const Padding(
-                      padding: EdgeInsets.all(8.0),
-                      child: Text(
-                        'No folder selected or no .json files found.',
-                        textAlign: TextAlign.center,
-                      ),
-                    )
-                  else
-                    ConstrainedBox(
-                      constraints: const BoxConstraints(maxHeight: 200),
-                      child: ListView.builder(
-                        shrinkWrap: true,
-                        itemCount: _treeFilesInFolder.length,
-                        itemBuilder: (context, index) {
-                          final file = _treeFilesInFolder[index];
-                          return ListTile(
-                            leading: const Icon(Icons.insights),
-                            title: Text(
-                              p.basename(file.path),
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                            selected: _treeModel?.sourcePath == file.path,
-                            onTap: () => _loadTreeModel(file as File),
-                          );
-                        },
-                      ),
-                    ),
-                ],
-              ),
-              const Divider(height: 24),
-              if (_treeModel != null)
-                ExpansionTile(
-                  title: const Text('Model Metadata'),
-                  children: _treeModel!.meta.entries.map((entry) {
-                    return ListTile(
-                      title: Text(entry.key),
-                      subtitle: Text(entry.value.toString()),
-                      dense: true,
-                    );
-                  }).toList(),
-                ),
-              if (_treeModel != null) const Divider(height: 24),
-              Text("Controls", style: Theme.of(context).textTheme.titleSmall),
-              const SizedBox(height: 8),
-              SwitchListTile(
-                title: const Text('Show Probabilities'),
-                value: _showProbabilities,
-                onChanged: _treeProbabilities == null
-                    ? null
-                    : (value) {
-                        setState(() => _showProbabilities = value);
-                      },
-              ),
-              const SizedBox(height: 16),
-              Text(
-                'Add labels if > ${(_autoLabelAddThreshold * 100).toStringAsFixed(0)}%',
-              ),
-              Slider(
-                value: _autoLabelAddThreshold,
-                min: 0.0,
-                max: 1.0,
-                divisions: 20,
-                label: '${(_autoLabelAddThreshold * 100).toStringAsFixed(0)}%',
-                onChanged: !canAutoLabel
-                    ? null
-                    : (value) {
-                        setState(() {
-                          _autoLabelAddThreshold = value;
-                          if (_autoLabelRemoveThreshold > value) {
-                            _autoLabelRemoveThreshold = value;
-                          }
-                        });
-                      },
-              ),
-              Text(
-                'Remove labels if < ${(_autoLabelRemoveThreshold * 100).toStringAsFixed(0)}%',
-              ),
-              Slider(
-                value: _autoLabelRemoveThreshold,
-                min: 0.0,
-                max: 1.0,
-                divisions: 20,
-                label:
-                    '${(_autoLabelRemoveThreshold * 100).toStringAsFixed(0)}%',
-                onChanged: !canAutoLabel
-                    ? null
-                    : (value) {
-                        setState(() {
-                          _autoLabelRemoveThreshold = value;
-                          if (_autoLabelAddThreshold < value) {
-                            _autoLabelAddThreshold = value;
-                          }
-                        });
-                      },
-              ),
-              const SizedBox(height: 8),
-              ElevatedButton.icon(
-                icon: const Icon(Icons.auto_fix_high),
-                label: const Text('Apply Auto-Labels'),
-                onPressed: canAutoLabel ? _applyAutoLabels : null,
-              ),
-              const SizedBox(height: 8),
-              TextButton.icon(
-                style: TextButton.styleFrom(
-                  foregroundColor: Theme.of(context).colorScheme.error,
-                ),
-                icon: const Icon(Icons.restore),
-                label: const Text('Revert All Changes'),
-                onPressed: _resetChartEdits,
-              ),
             ],
           ),
-        ),
-      ],
+          if (_treeModel != null) ...[
+            const Divider(height: 24),
+            ExpansionTile(
+              title: const Text('Model Metadata'),
+              initiallyExpanded: true,
+              children: _treeModel!.meta.entries.map((entry) {
+                return ListTile(
+                  title: Text(
+                    entry.key,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                  subtitle: SelectableText(formatMetadataValue(entry.value)),
+                );
+              }).toList(),
+            ),
+            const Divider(height: 24),
+            Text("Controls", style: Theme.of(context).textTheme.titleSmall),
+            const SizedBox(height: 8),
+            SwitchListTile(
+              title: const Text('Show Probabilities'),
+              value: _showProbabilities,
+              onChanged: _treeProbabilities == null
+                  ? null
+                  : (value) => setState(() => _showProbabilities = value),
+            ),
+            if (_showProbabilities && _treeProbabilities != null) ...[
+              const SizedBox(height: 8),
+              SegmentedButton<bool>(
+                segments: const [
+                  ButtonSegment(
+                    value: false,
+                    label: Text('Line'),
+                    icon: Icon(Icons.show_chart),
+                  ),
+                  ButtonSegment(
+                    value: true,
+                    label: Text('Bar'),
+                    icon: Icon(Icons.bar_chart),
+                  ),
+                ],
+                selected: {_probabilityChartTypeIsBar},
+                onSelectionChanged: (newSelection) => setState(
+                  () => _probabilityChartTypeIsBar = newSelection.first,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Opacity: ${(_probabilityOpacity * 100).toStringAsFixed(0)}%',
+              ),
+              Slider(
+                value: _probabilityOpacity,
+                min: 0.1,
+                max: 1.0,
+                onChanged: (value) =>
+                    setState(() => _probabilityOpacity = value),
+              ),
+            ],
+            const SizedBox(height: 16),
+            Text(
+              'Add labels if > ${(_autoLabelAddThreshold * 100).toStringAsFixed(0)}%',
+            ),
+            Slider(
+              value: _autoLabelAddThreshold,
+              min: 0.0,
+              max: 1.0,
+              divisions: 20,
+              label: '${(_autoLabelAddThreshold * 100).toStringAsFixed(0)}%',
+              onChanged: !canAutoLabel
+                  ? null
+                  : (value) => setState(() {
+                      _autoLabelAddThreshold = value;
+                      if (_autoLabelRemoveThreshold > value)
+                        _autoLabelRemoveThreshold = value;
+                    }),
+            ),
+            Text(
+              'Remove labels if < ${(_autoLabelRemoveThreshold * 100).toStringAsFixed(0)}%',
+            ),
+            Slider(
+              value: _autoLabelRemoveThreshold,
+              min: 0.0,
+              max: 1.0,
+              divisions: 20,
+              label: '${(_autoLabelRemoveThreshold * 100).toStringAsFixed(0)}%',
+              onChanged: !canAutoLabel
+                  ? null
+                  : (value) => setState(() {
+                      _autoLabelRemoveThreshold = value;
+                      if (_autoLabelAddThreshold < value)
+                        _autoLabelAddThreshold = value;
+                    }),
+            ),
+            const SizedBox(height: 8),
+            ElevatedButton.icon(
+              icon: const Icon(Icons.auto_fix_high),
+              label: const Text('Apply Auto-Labels'),
+              onPressed: canAutoLabel ? _applyAutoLabels : null,
+            ),
+          ],
+        ],
+      ),
     );
   }
 
@@ -1255,6 +1863,11 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
                 ),
               ),
               IconButton(
+                icon: const Icon(Icons.refresh),
+                onPressed: _loadCsvFilesInFolder,
+                tooltip: 'Reload Folder',
+              ),
+              IconButton(
                 icon: const Icon(Icons.folder_open),
                 onPressed: _pickProjectFolder,
                 tooltip: 'Change Project Folder',
@@ -1262,14 +1875,25 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
             ],
           ),
         ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16.0),
+          child: TextField(
+            controller: _projectFilterController,
+            decoration: const InputDecoration(
+              hintText: 'Filter files...',
+              prefixIcon: Icon(Icons.search),
+              isDense: true,
+            ),
+          ),
+        ),
         const Divider(height: 1),
         Expanded(
-          child: _csvFilesInProject.isEmpty
+          child: _filteredCsvFilesInProject.isEmpty
               ? const Center(child: Text('No .csv files found in this folder.'))
               : ListView.builder(
-                  itemCount: _csvFilesInProject.length,
+                  itemCount: _filteredCsvFilesInProject.length,
                   itemBuilder: (context, index) {
-                    final file = _csvFilesInProject[index];
+                    final file = _filteredCsvFilesInProject[index];
                     return ListTile(
                       title: Text(p.basename(file.path)),
                       leading: const Icon(Icons.description_outlined),
@@ -1351,57 +1975,6 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
   Widget _buildChartView() {
     return Column(
       children: [
-        Padding(
-          padding: const EdgeInsets.all(8.0),
-          child: Row(
-            children: [
-              Expanded(
-                child: DropdownButton<int>(
-                  isExpanded: true,
-                  value: _labelColumnIndex,
-                  hint: const Text('Choose Label Column'),
-                  items:
-                      _filteredCsvHeaders
-                          ?.asMap()
-                          .entries
-                          .map(
-                            (entry) => DropdownMenuItem<int>(
-                              value: entry.key,
-                              child: Text(entry.value),
-                            ),
-                          )
-                          .toList() ??
-                      [],
-                  onChanged: _updateLabelColumn,
-                ),
-              ),
-              const SizedBox(width: 16),
-              Expanded(
-                child: DropdownButton<dynamic>(
-                  isExpanded: true,
-                  value: _selectedLabelValue,
-                  hint: const Text('Select Label Value'),
-                  items: _labelColumnIndex == null
-                      ? []
-                      : _uniqueValuesInLabelColumn
-                            .map(
-                              (value) => DropdownMenuItem<dynamic>(
-                                value: value,
-                                child: Text(value.toString()),
-                              ),
-                            )
-                            .toList(),
-                  onChanged: (newValue) => setState(() {
-                    _selectedLabelValue = newValue;
-                    _treeProbabilities = null;
-                    _chartData = _prepareChartData(_filteredCsvData!);
-                    _originalChartData = _prepareChartData(_filteredCsvData!);
-                  }),
-                ),
-              ),
-            ],
-          ),
-        ),
         const Divider(height: 1),
         Expanded(
           child: (_filteredCsvData == null)
@@ -1446,6 +2019,30 @@ class _ChartViewerPageState extends State<ChartViewerPage> {
                   series: _createSeries(),
                 ),
         ),
+      ],
+    );
+  }
+}
+
+// === REFACTORED WIDGET ===
+// This reusable widget reduces boilerplate in all the `_build...Panel` methods.
+class _SidePanelTemplate extends StatelessWidget {
+  final String title;
+  final Widget child;
+
+  const _SidePanelTemplate({required this.title, required this.child});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Text(title, style: Theme.of(context).textTheme.titleLarge),
+        ),
+        const Divider(height: 1),
+        Expanded(child: child),
       ],
     );
   }
