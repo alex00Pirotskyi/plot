@@ -34,6 +34,11 @@ dependencies:
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
+  syncfusion_flutter_charts: ^31.1.21
+  file_picker: ^10.3.3
+  csv: ^6.0.0
+  shared_preferences: ^2.5.3
+  path: ^1.9.1
 
 dev_dependencies:
   flutter_test:
@@ -45,11 +50,7 @@ dev_dependencies:
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
-  syncfusion_flutter_charts: ^31.1.21
-  file_picker: ^10.3.3
-  csv: ^6.0.0
-  shared_preferences: ^2.5.3
-  path: ^1.9.1
+  flutter_launcher_icons: ^0.14.4
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
@@ -61,6 +62,19 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+flutter_launcher_icons:
+  image_path: "assets/icon/app_icon.png"   # Path to your icon
+  android: true                           # Still works for Android
+  ios: true                               # Still works for iOS
+  remove_alpha_ios: true
+
+  # UPDATED SECTION
+  web:
+    generate: false # Use 'generate: false' to disable web
+  windows:
+    generate: true  # Use 'generate: true' to enable windows
+  macos:
+    generate: true  # Use 'generate: true' to enable macos
 
   # To add assets to your application, add an assets section, like this:
   # assets:
